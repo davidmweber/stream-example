@@ -9,13 +9,14 @@ import akka.stream.ActorMaterializer
 import akka.stream.scaladsl.Flow
 import akka.http.scaladsl.model.ws.{Message, TextMessage}
 import akka.stream.actor.ActorPublisher
+import akka.stream.actor.ActorPublisherMessage.Request
 import akka.stream.scaladsl._
 import akka.stream.{FlowShape, OverflowStrategy}
 import akka.util.ByteString
+
 import scala.concurrent.ExecutionContext.Implicits.global
-
+import scala.collection.mutable
 import scala.concurrent.duration._
-
 import scala.io.StdIn
 
 object ws2 extends App {
@@ -35,68 +36,85 @@ object ws2 extends App {
 
   case object ConnectionClosed
 
-  class EchoActor extends ActorPublisher[IntMessage] with ActorLogging {
+  class EchoActor extends ActorPublisher[IntMessage] {
 
-    log.debug(s"Actor created at: ${System.currentTimeMillis()}")
     println(s"Actor created at: ${System.currentTimeMillis()}")
 
+    context.system.scheduler.schedule(5 seconds, 3 seconds, self, "Test")
 
     override def receive: Receive = idle
 
+    var queue: mutable.Queue[IntMessage] = mutable.Queue()
+
     def idle: Receive = {
       case "Test" => onNext(IntMessage(s"Publish: ${System.currentTimeMillis()}"))
+
       case IntMessage(m) ⇒
-//        context.system.scheduler.schedule(0 seconds, 3 seconds, self, "Test")
-        log.debug(s"Recived message: $m")
         println(s"Recived message: $m")
-//        onNext(IntMessage(s"Echo: $m"))
+        println("Sending back")
+        queue.enqueue(IntMessage(s"Echo: $m"))
+        send()
+
       case ConnectionClosed =>
-        log.debug("The connection was closed")
         println("The connection was closed")
-      case _ =>
-        log.debug("Wrong message received in idle state")
-        println("Wrong message received in idle state")
+
+      case Request(cnt) => send()
+
+      case other =>
+        println(s"Wrong message received in idle state: $other")
     }
 
-
+    def send() = {
+      while (queue.nonEmpty && isActive && totalDemand > 0) {
+        val element = queue.dequeue()
+        try {
+          onNext(element)
+        } catch {
+          case error: Throwable ⇒
+            println(s"Something went wrong: $error")
+            queue.enqueue(element)
+        }
+      }
+    }
   }
 
   def actorFlow: Flow[Message, Message, Any] =
     Flow.fromGraph(
 
-      GraphDSL.create(Source.actorRef[IntMessage](bufferSize = 5, OverflowStrategy.fail)) {
+      GraphDSL.create() {
         implicit builder =>
-          source =>
 
-            import GraphDSL.Implicits._
+          import GraphDSL.Implicits._
 
-            val d = Source.actorRef[IntMessage](bufferSize = 5, OverflowStrategy.fail)
+          val d = Source.actorRef[IntMessage](bufferSize = 5, OverflowStrategy.fail)
 
-            //input flow, all Messages
-            val fromWebsocket = builder.add(
-              Flow[Message].collect {
-                case TextMessage.Strict(txt) => IntMessage(txt)
-              })
+          //input flow, all Messages
+          val fromWebsocket = builder.add(
+            Flow[Message].collect {
+              case TextMessage.Strict(txt) => IntMessage(txt)
+            })
 
-            //output flow, it returns Message's
-            val backToWebsocket = builder.add(
-              Flow[IntMessage].map {
-                case IntMessage(msg) => TextMessage.Strict(msg)
-              }
-            )
+          //output flow, it returns Message's
+          val backToWebsocket = builder.add(
+            Flow[IntMessage].map {
+              case IntMessage(msg) => TextMessage.Strict(msg)
+            }
+          )
 
-            val broker = actorSystem.actorOf(Props(classOf[EchoActor]))
+          val broker = actorSystem.actorOf(Props(classOf[EchoActor]))
 
-            val brokerSink = Sink.actorRef(broker, ConnectionClosed)
+          val source = Source.fromPublisher(ActorPublisher[IntMessage](broker))
 
-            //Message from websocket is converted into IncommingMessage and should be send to each in room
-            fromWebsocket ~> brokerSink
+          val sink = Sink.actorRef(broker, ConnectionClosed)
 
-            //Actor already sit in chatRoom so each message from room is used as source and pushed back into websocket
-            source ~> backToWebsocket
+          //Message from websocket is converted into IncommingMessage and should be send to each in room
+          fromWebsocket ~> sink
 
-            // expose ports
-            FlowShape(fromWebsocket.in, backToWebsocket.out)
+          //Actor already sit in chatRoom so each message from room is used as source and pushed back into websocket
+          source ~> backToWebsocket
+
+          // expose ports
+          FlowShape(fromWebsocket.in, backToWebsocket.out)
       }
 
     )
@@ -117,7 +135,7 @@ object ws2 extends App {
 
   import actorSystem.dispatcher
 
-//  binding.map(_.unbind()).onComplete(_ => actorSystem.shutdown())
+  //  binding.map(_.unbind()).onComplete(_ => actorSystem.shutdown())
   println("Server is down...")
 }
 
